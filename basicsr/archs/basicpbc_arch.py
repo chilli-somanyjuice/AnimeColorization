@@ -42,6 +42,7 @@
 # %BANNER_END%
 
 import argparse
+import math
 import open_clip
 import torch
 import torch.nn.functional as F
@@ -536,10 +537,7 @@ class BasicPBC(nn.Module):
         descriptor_dim=128,
         keypoint_encoder=[32, 64, 128],
         GNN_layer_num=9,
-        use_clip=False,
-        encoder_resolution=None,
-        raft_resolution=None,
-        clip_resolution=(320, 320),
+        max_num_frames=10  # 최대 처리할 수 있는 프레임 수
     ):
         super().__init__()
 
@@ -549,10 +547,7 @@ class BasicPBC(nn.Module):
         config.keypoint_encoder = keypoint_encoder
         config.GNN_layers_num = GNN_layer_num
         config.GNN_layers = ["self", "cross"] * GNN_layer_num
-        config.use_clip = use_clip
-        config.encoder_resolution = encoder_resolution
-        config.raft_resolution = raft_resolution
-        config.clip_resolution = clip_resolution
+        config.max_num_frames = max_num_frames
 
         self.config = config
 
@@ -560,143 +555,137 @@ class BasicPBC(nn.Module):
         self.gnn = AttentionalGNN(self.config.descriptor_dim, self.config.GNN_layers)
         self.final_proj = nn.Conv1d(self.config.descriptor_dim, self.config.descriptor_dim, kernel_size=1, bias=True)
 
-        args = {
-            "mixed_precision": False,
-            "small": False,
-            "ckpt": "raft/ckpt/raft-animerun-v2-ft_again.pth",
-            "freeze": True,
-        }
-
-        self.raft = RAFT(args)
-        state_dict = torch.load(args["ckpt"])
-        real_state_dict = {k.split("module.")[-1]: v for k, v in state_dict.items()}
-        self.raft.load_state_dict(real_state_dict)
-        for param in self.raft.parameters():
-            param.requires_grad = False
+        # Add temporal encoding
+        self.temporal_encoding = nn.Parameter(
+            torch.zeros(max_num_frames, self.config.descriptor_dim)
+        )
+        self._init_temporal_encoding()
 
         bin_score = torch.nn.Parameter(torch.tensor(1.0))
         self.register_parameter("bin_score", bin_score)
         self.segment_desc = SegmentDescriptor(
-            self.config.descriptor_dim, self.config.ch_in, self.config.use_clip, self.config.encoder_resolution, self.config.clip_resolution
+            self.config.descriptor_dim, 
+            self.config.ch_in
         )
 
-    def forward(self, data):
-        """Run SuperGlue on a pair of keypoints and descriptors"""
-        kpts, kpts_ref = (data["keypoints"].float(), data["keypoints_ref"].float())
+    def _init_temporal_encoding(self):
+        position = torch.arange(self.config.max_num_frames).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.config.descriptor_dim, 2) * 
+            (-math.log(10000.0) / self.config.descriptor_dim)
+        )
+        
+        self.temporal_encoding[:, 0::2] = torch.sin(position * div_term)
+        self.temporal_encoding[:, 1::2] = torch.cos(position * div_term)
 
-        if kpts.shape[1] < 2 or kpts_ref.shape[1] < 2:  # no keypoints
-            shape = kpts.shape[:-1]
+    def forward(self, data):
+        """Run matching between one reference frame and multiple target frames"""
+        
+        # Process reference frame
+        kpts_ref = data["keypoints_ref"].float()
+        desc_ref = self.segment_desc(data["line_ref"], data["segment_ref"])
+        desc_ref = desc_ref[..., 1:]  # [B, C, N_ref]
+        pos_ref = self.kenc(normalize_keypoints(kpts_ref, data["line_ref"].shape))
+        desc_ref = desc_ref + pos_ref
+
+        # Process all target frames together
+        B = desc_ref.shape[0]
+        all_kpts = torch.stack([data["keypoints_list"][i].float() for i in range(self.config.num_target_frames)], dim=1)  # [B, T, N, 4]
+        all_desc = []
+        
+        for i in range(self.config.num_target_frames):
+            desc_i = self.segment_desc(data["line_list"][i], data["segment_list"][i])
+            desc_i = desc_i[..., 1:]  # [B, C, N_i]
+            pos_i = self.kenc(normalize_keypoints(data["keypoints_list"][i], data["line_list"][i].shape))
+            desc_i = desc_i + pos_i
+            # Add temporal encoding
+            temporal_code = self.temporal_encoding[i:i+1].transpose(1, 2)
+            desc_i = desc_i + temporal_code
+            all_desc.append(desc_i)
+
+        # Concatenate all descriptors along the sequence dimension
+        all_desc = torch.cat(all_desc, dim=2)  # [B, C, T*N]
+        
+        # Skip if no keypoints
+        if all_desc.shape[2] < 2 or desc_ref.shape[2] < 2:
             print(f"No keypoints in {data['file_name'][0]}")
             return {
-                "matches0": kpts.new_full(shape, -1, dtype=torch.int)[0],
-                "matching_scores0": kpts.new_zeros(shape)[0],
+                "matches0": torch.full((0,), -1, dtype=torch.int, device=desc_ref.device),
+                "matching_scores0": torch.zeros(0, device=desc_ref.device),
                 "skip_train": True,
             }
 
-        line, line_ref, color_ref = data["line"], data["line_ref"], data["recolorized_img"]
-        h, w = line.shape[-2:]
-        if self.config.raft_resolution:
-            line = F.interpolate(line, self.config.raft_resolution, mode="bilinear", align_corners=False)
-            line_ref = F.interpolate(line_ref, self.config.raft_resolution, mode="bilinear", align_corners=False)
-            color_ref = F.interpolate(color_ref, self.config.raft_resolution, mode="bilinear", align_corners=False)
-        self.raft.eval()
-        _, flow_up = self.raft(line, line_ref, iters=20, test_mode=True)
-        warpped_img = flow_warp(color_ref, flow_up.permute(0, 2, 3, 1).detach(), "nearest")
-        warpped_img = F.interpolate(warpped_img, (h, w), mode="bilinear", align_corners=False)
+        # Multi-layer Transformer network
+        desc_src, desc_ref = self.gnn(all_desc, desc_ref)
 
-        if self.config.ch_in == 6:
-            warpped_target_img = torch.cat((warpped_img, data["line"]), dim=1)
-            warpped_ref_img = torch.cat((data["recolorized_img"], data["line_ref"]), dim=1)
-        else:
-            assert False, "Input channel only supports 6 with 3 as line and 3 as color."
-        if self.config.use_clip:
-            desc = self.segment_desc(warpped_target_img, data["segment"], data["line"], use_offset=True)
-            desc_ref = self.segment_desc(warpped_ref_img, data["segment_ref"], data["line_ref"])
-        else:
-            desc = self.segment_desc(warpped_target_img, data["segment"], use_offset=True)
-            desc_ref = self.segment_desc(warpped_ref_img, data["segment_ref"])
-        desc = desc[..., 1:]
-        desc_ref = desc_ref[..., 1:]
+        # Final MLP projection
+        mdesc = self.final_proj(desc_src)  # [B, C, T*N]
+        mdesc_ref = self.final_proj(desc_ref)  # [B, C, N_ref]
 
-        all_matches = data["all_matches"] if "all_matches" in data else None  # shape = (1, K1)
+        # Compute matching scores
+        scores = torch.einsum("bdn,bdm->bnm", mdesc, mdesc_ref)  # [B, T*N, N_ref]
+        scores = scores / (self.config.descriptor_dim ** 0.5)
 
-        # positional embedding
-        # Keypoint normalization.
-        kpts = normalize_keypoints(kpts, data["line"].shape)
-        kpts_ref = normalize_keypoints(kpts_ref, data["line_ref"].shape)
+        # Run optimal transport
+        scores = transport(scores, self.bin_score)  # [B, T*N, N_ref+1]
 
-        # Keypoint MLP encoder.
-
-        pos = self.kenc(kpts)
-        pos_ref = self.kenc(kpts_ref)
-
-        desc = desc + pos
-        desc_ref = desc_ref + pos_ref
-
-        # Multi-layer Transformer network.
-        desc, desc_ref = self.gnn(desc, desc_ref)
-
-        # Final MLP projection.
-        mdesc, mdesc_ref = self.final_proj(desc), self.final_proj(desc_ref)
-
-        # Compute matching descriptor distance.
-        scores = torch.einsum("bdn,bdm->bnm", mdesc, mdesc_ref)
-
-        # b k1 k2
-        scores = scores / (self.config.descriptor_dim) ** 0.5
-
-        # Run the optimal transport.
-        b, m, n = scores.size()
-
-        scores = transport(scores, self.bin_score)
-
+        # Process all matches
+        all_matches = torch.cat([match for match in data["all_matches_list"]], dim=1) if "all_matches_list" in data else None
         all_matches_origin = all_matches.clone() if all_matches is not None else None
 
         if all_matches is not None:
+            n = scores.shape[2] - 1  # N_ref
             all_matches[all_matches == -1] = n
-            loss = nn.functional.cross_entropy(scores[:, :-1, :].view(-1, n + 1), all_matches.long().view(-1), reduction="mean")
-            loss = loss.mean()
+            loss = nn.functional.cross_entropy(
+                scores[:, :-1, :].reshape(-1, n + 1),
+                all_matches.long().reshape(-1),
+                reduction="mean"
+            )
 
         scores = nn.functional.softmax(scores, dim=2)
-
         max0, max1 = scores[:, :-1, :].max(2), scores[:, :, :-1].max(1)
         indices0, indices1 = max0.indices, max1.indices
         mscores0 = max0.values
 
-        valid0 = indices0 < n
-        valid1 = indices1 < m
+        valid0 = indices0 < scores.shape[2] - 1
+        valid1 = indices1 < scores.shape[1]
         indices0 = torch.where(valid0, indices0, indices0.new_tensor(-1))
         indices1 = torch.where(valid1, indices1, indices1.new_tensor(-1))
 
-        if all_matches is None:
-            return {
-                "match_scores": scores[:, :-1, :][0],
-                "matches0": indices0[0],  # use -1 for invalid match
-                "matching_scores0": mscores0[0],
-                "loss": -1,
-                "skip_train": True,
-                "accuracy": -1,
-                "area_accuracy": -1,
-                "valid_accuracy": -1,
-                "invalid_accuracy": -1,
-            }
-        else:
+        output = {
+            "match_scores": scores[:, :-1, :][0],
+            "matches0": indices0[0],
+            "matching_scores0": mscores0[0],
+            "skip_train": all_matches is None,
+        }
+
+        if all_matches is not None:
             is_correct = all_matches_origin[0] == indices0[0]
             accuracy = (is_correct.sum() / len(all_matches_origin[0])).item()
+            
             correct_indices = torch.arange(len(all_matches_origin[0]), device=is_correct.device)[is_correct]
-            area_accuracy = (torch.tensor([(data["segment"] == idx + 1).sum() for idx in correct_indices]).sum() / data["numpixels"].sum()).item()
+            
+            # Calculate total area accuracy across all frames
+            total_area_correct = 0
+            total_pixels = 0
+            for i, idx in enumerate(correct_indices):
+                frame_idx = idx // (len(all_matches_origin[0]) // self.config.num_target_frames)
+                segment_idx = idx % (len(all_matches_origin[0]) // self.config.num_target_frames)
+                total_area_correct += (data["segment_list"][frame_idx] == segment_idx + 1).sum()
+                total_pixels += data["numpixels_list"][frame_idx].sum()
+            
+            area_accuracy = (total_area_correct / total_pixels).item()
+            
             is_valid = all_matches_origin[0] != -1
             valid_accuracy = ((is_correct & is_valid).sum() / is_valid.sum()).item()
             invalid_accuracy = ((is_correct & ~is_valid).sum() / (~is_valid).sum()).item() if (~is_valid).sum() > 0 else None
 
-            return {
-                "match_scores": scores[:, :-1, :][0],
-                "matches0": indices0[0],  # use -1 for invalid match
-                "matching_scores0": mscores0[0],
+            output.update({
                 "loss": loss,
-                "skip_train": False,
                 "accuracy": accuracy,
                 "area_accuracy": area_accuracy,
                 "valid_accuracy": valid_accuracy,
                 "invalid_accuracy": invalid_accuracy,
-            }
+            })
+
+        return output
