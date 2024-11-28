@@ -575,8 +575,13 @@ class BasicPBC(nn.Module):
             (-math.log(10000.0) / self.config.descriptor_dim)
         )
         
-        self.temporal_encoding[:, 0::2] = torch.sin(position * div_term)
-        self.temporal_encoding[:, 1::2] = torch.cos(position * div_term)
+        # Create a new tensor for the temporal encoding
+        temporal_encoding = torch.zeros(self.config.max_num_frames, self.config.descriptor_dim)
+        temporal_encoding[:, 0::2] = torch.sin(position * div_term)
+        temporal_encoding[:, 1::2] = torch.cos(position * div_term)
+        
+        # Register the new tensor as a parameter
+        self.temporal_encoding = nn.Parameter(temporal_encoding)
 
     def forward(self, data):
         """Run matching between one reference frame and multiple target frames"""

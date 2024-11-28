@@ -290,6 +290,7 @@ class PaintBucketLabelSegDataset(AnimeLabelSegDataset):
         assert self.color_redistribution_type in [None, "seg"]
         self.merge_label_prob = opt["merge_label_prob"] if "merge_label_prob" in opt else 0.0
         self.frame_distance_list = opt["frame_distance_list"] if "frame_distance_list" in opt else [1]
+        self.num_target_frames = opt.get("max_num_frames", 1)
 
         for character in os.listdir(self.root):
 
