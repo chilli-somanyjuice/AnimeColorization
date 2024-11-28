@@ -15,8 +15,8 @@ datasets:
       resize: 960
       crop: 640
       rotate_prob: 0.5
-    # root: dataset/train/PaintBucket_Char/
-    root: dataset/PaintBucket_Char/train/PaintBucket_Char/
+    root: dataset/train/PaintBucket_Char/
+    # root: dataset/PaintBucket_Char/train/PaintBucket_Char/
     merge_label_prob: 0.2
     shuffle_label: false
     color_redistribution_type: seg
@@ -31,8 +31,8 @@ datasets:
   val:
     name: PaintBucket_Char
     type: PaintBucketSegMat
-    # root: dataset/test/PaintBucket_Char/
-    root: dataset/PaintBucket_Char/test/PaintBucket_Char/
+    root: dataset/test/PaintBucket_Char/
+    # root: dataset/PaintBucket_Char/test/PaintBucket_Char/
     dstype: contour
     split: test
     is_png_seg: true
