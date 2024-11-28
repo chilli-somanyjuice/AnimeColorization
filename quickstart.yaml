@@ -1,0 +1,20 @@
+name: experiment1
+import:
+  /root/:
+    git:
+      url: github.com/chilli-somanyjuice/AnimeColorization.git
+      ref: main
+resources:
+  cluster: snu-eng-dgx
+  preset: a100-1
+  node_names:
+    - snuengdgx001
+    - snuengdgx002
+    - snuengdgx003
+image: quay.io/vessl-ai/torch:2.3.1-cuda12.1-r5
+run: |-
+  pip install -r requirements.txt
+  python setup.py develop
+  pip uninstall opencv-python
+  pip install opencv-python
+  python basicsr/train.py -opt options/train/basicpbc_pbch_train_option.yml
