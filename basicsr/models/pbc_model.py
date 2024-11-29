@@ -50,11 +50,16 @@ class PBCModel(SRModel):
         self.setup_schedulers()
 
     def feed_data(self, data):
-        self.data = data
+        self.data = {}
         white_list = ["file_name"]
         for key in data.keys():
             if key not in white_list:
-                self.data[key] = data[key].to(self.device)
+                if isinstance(data[key], list):
+                    # 리스트인 경우 각 요소를 device로 이동
+                    self.data[key] = [item.to(self.device) if isinstance(item, torch.Tensor) else item for item in data[key]]
+                else:
+                    # 기존 처리 방식
+                    self.data[key] = data[key].to(self.device) if isinstance(data[key], torch.Tensor) else data[key]
 
     def optimize_parameters(self, current_iter):
 
