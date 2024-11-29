@@ -87,6 +87,7 @@ class AnimeLabelSegDataset(data.Dataset):
         self.shuffle_label = False  # Shuffle the index of the labels
         self.color_redistribution_type = False  # Recolorize the label based on randomly selected colors, mainly used for the optical flow module
         self.merge_label_prob = 0.0  # Merge the labels as the data augmentation
+        self.num_target_frames = 12
 
         # image, seg, matching index
         self.line_list = []
@@ -108,51 +109,95 @@ class AnimeLabelSegDataset(data.Dataset):
         numpixels_list = []
         mat_index_list = []
         
+        # Process reference frame first (outside the loop)
+        line_ref = read_img_2_np(self.line_list[index][0])
+        label_ref = read_seg_2_np(self.label_list[index][0])
+
+        # Augment reference frame if needed
+        if self.augmentor is not None:
+            line_ref, label_ref = self.augmentor(line_ref, label_ref)
+
+        label_ref_list = np.unique(label_ref[label_ref != 0])
+        if self.shuffle_label:
+            np.random.shuffle(label_ref_list)
+            # -1 means background in label, move it to top
+            label_ref_list = np.concatenate(([-1], label_ref_list[label_ref_list != -1])) if -1 in label_ref_list else label_ref_list
+
+        # Process reference frame keypoints
+        h, w = label_ref.shape
+        hh = np.arange(h)
+        ww = np.arange(w)
+        xx, yy = np.meshgrid(ww, hh)
+
+        label_ref_index = 1
+        keypoints_ref = []
+        centerpoints_ref = []
+        numpixels_ref = []
+        label_ref_relabeled = np.zeros_like(label_ref)
+
+        for i, label_idx in enumerate(label_ref_list):
+            mask = label_ref == label_idx
+            merge = i > 5 and np.random.rand() <= self.merge_label_prob
+            if merge:
+                selected_label = np.random.randint(2, label_ref_index)
+            else:
+                selected_label = label_ref_index
+                label_ref_index += 1
+            label_ref_relabeled[mask] = selected_label
+            mask = label_ref_relabeled == selected_label
+
+            xs = xx[mask]
+            ys = yy[mask]
+
+            xmin = xs.min()
+            xmax = xs.max()
+            ymin = ys.min()
+            ymax = ys.max()
+            xmean = xs.mean()
+            ymean = ys.mean()
+
+            if merge:
+                centerpoints_ref[selected_label - 1] = [xmean, ymean]
+                numpixels_ref[selected_label - 1] = mask.sum()
+                keypoints_ref[selected_label - 1] = [xmin, xmax, ymin, ymax]
+            else:
+                centerpoints_ref.append([xmean, ymean])
+                numpixels_ref.append(mask.sum())
+                keypoints_ref.append([xmin, xmax, ymin, ymax])
+
+        keypoints_ref = np.stack(keypoints_ref)
+        centerpoints_ref = np.stack(centerpoints_ref)
+        numpixels_ref = np.stack(numpixels_ref)
+
+        # Process target frames in loop
         for i in range(self.num_target_frames):
-            # read images
-            line = read_img_2_np(self.line_list[index][0])
-            line_ref = read_img_2_np(self.line_list[index][1])
+            # read target image and seg
+            line = read_img_2_np(self.line_list[index][i+1])
+            seg = read_seg_2_np(self.seg_list[index][i+1])
 
-            # load seg for target and label for reference
-            # label starts from -1 (background), 0 means black line
-            seg = read_seg_2_np(self.seg_list[index][0])
-            label_ref = read_seg_2_np(self.label_list[index][1])
-
-            # seg idx to label idx
-            seg_label_idx_map = load_json(self.idx_list[index][0])
+            # seg idx to label idx mapping
+            seg_label_idx_map = load_json(self.idx_list[index][i+1])
             seg_label_idx_map = {int(k): v[1] for k, v in seg_label_idx_map.items()}
 
-            # autmentation
+            # augment target frame if needed
             if self.augmentor is not None:
                 line, seg = self.augmentor(line, seg)
-                line_ref, label_ref = self.augmentor(line_ref, label_ref)
 
-            seg_list = np.unique(seg[seg != 0])  # 0 means line
-            label_ref_list = np.unique(label_ref[label_ref != 0])
-
+            seg_list = np.unique(seg[seg != 0])
             if self.shuffle_label:
                 np.random.shuffle(seg_list)
-                np.random.shuffle(label_ref_list)
-                # -1 means background in label, move it to top
-                label_ref_list = np.concatenate(([-1], label_ref_list[label_ref_list != -1])) if -1 in label_ref_list else label_ref_list
 
             # match seg to label_ref
-            seg_list, label_ref_list = list(seg_list), list(label_ref_list)
+            seg_list = list(seg_list)
             mat_index = [(label_ref_list.index(seg_label_idx_map[x]) if seg_label_idx_map[x] in label_ref_list else -1) for x in seg_list]
             mat_index = np.array(mat_index).astype(np.int64)
 
             keypoints = []
             centerpoints = []
             numpixels = []
-
-            h, w = seg.shape
-            hh = np.arange(h)
-            ww = np.arange(w)
-            xx, yy = np.meshgrid(ww, hh)
-
             seg_relabeled = np.zeros_like(seg)
 
-            for i, seg_idx in enumerate(seg_list):
+            for j, seg_idx in enumerate(seg_list):
                 mask = seg == seg_idx
                 xs = xx[mask]
                 ys = yy[mask]
@@ -167,80 +212,18 @@ class AnimeLabelSegDataset(data.Dataset):
                 centerpoints.append([xmean, ymean])
                 numpixels.append(mask.sum())
                 keypoints.append([xmin, xmax, ymin, ymax])
-                seg_relabeled[mask] = i + 1  # 0 is for the black line,starts from 1
-
-            label_ref_index = 1
-            keypoints_ref = []
-            centerpoints_ref = []
-            numpixels_ref = []
-            label_ref_relabeled = np.zeros_like(label_ref)
-
-            for i, label_idx in enumerate(label_ref_list):
-                # label_ref_list starts from -1
-                mask = label_ref == label_idx
-                merge = i > 5 and np.random.rand() <= self.merge_label_prob
-                if merge:
-                    # randomly merge the label with the previous one
-                    selected_label = np.random.randint(2, label_ref_index)  # 0 means black line, and 1 means background
-                else:
-                    selected_label = label_ref_index
-                    label_ref_index += 1
-                label_ref_relabeled[mask] = selected_label
-                mask = label_ref_relabeled == selected_label
-
-                xs = xx[mask]
-                ys = yy[mask]
-
-                xmin = xs.min()
-                xmax = xs.max()
-                ymin = ys.min()
-                ymax = ys.max()
-                xmean = xs.mean()
-                ymean = ys.mean()
-
-                if merge:
-                    centerpoints_ref[selected_label - 1] = [xmean, ymean]
-                    numpixels_ref[selected_label - 1] = mask.sum()
-                    keypoints_ref[selected_label - 1] = [xmin, xmax, ymin, ymax]
-                else:
-                    centerpoints_ref.append([xmean, ymean])
-                    numpixels_ref.append(mask.sum())
-                    keypoints_ref.append([xmin, xmax, ymin, ymax])
-
-                # All the token which marks
-                mat_index = np.where(mat_index == i, selected_label - 1, mat_index)
-
-            seg = seg_relabeled
-            label_ref = label_ref_relabeled
+                seg_relabeled[mask] = j + 1
 
             keypoints = np.stack(keypoints)
-            keypoints_ref = np.stack(keypoints_ref)
             centerpoints = np.stack(centerpoints)
-            centerpoints_ref = np.stack(centerpoints_ref)
             numpixels = np.stack(numpixels)
-            numpixels_ref = np.stack(numpixels_ref)
 
-            # image output [0, 1]
+            # Convert to torch tensors
             line = torch.from_numpy(line).permute(2, 0, 1).float() / 255.0
-            line_ref = torch.from_numpy(line_ref).permute(2, 0, 1).float() / 255.0
-            seg = torch.from_numpy(seg)[None]
-            label_ref = torch.from_numpy(label_ref)[None]
+            seg = torch.from_numpy(seg_relabeled)[None]
             numpixels = torch.from_numpy(numpixels)[None]
-            numpixels_ref = torch.from_numpy(numpixels_ref)[None]
-
-            if self.color_redistribution_type == "seg":
-                recolorized_img = recolorize_seg(label_ref)
-            else:
-                recolorized_img = torch.Tensor(0)
-
-
-            # mat_index is like [0, 3, -1, ...]
-            # 0 means 'segment' with value 1 is in the 'segment_ref' with value 0+1 = 1 (value 0 in 'segment' and 'segment_ref' is black line)
-            # 3 means 'segment' with value 2 is in the 'segment_ref' with value 3+1 = 4
-            # -1 means 'segment' with value 3 does not have corresponding label in 'segment_ref'
-
             mat_index = torch.from_numpy(mat_index).float()
-            
+
             line_list.append(line)
             target_seg_list.append(seg)
             keypoints_list.append(keypoints)
@@ -248,14 +231,23 @@ class AnimeLabelSegDataset(data.Dataset):
             numpixels_list.append(numpixels)
             mat_index_list.append(mat_index)
 
+        # Convert reference frame to torch tensors
+        line_ref = torch.from_numpy(line_ref).permute(2, 0, 1).float() / 255.0
+        label_ref = torch.from_numpy(label_ref_relabeled)[None]
+        numpixels_ref = torch.from_numpy(numpixels_ref)[None]
+
+        if self.color_redistribution_type == "seg":
+            recolorized_img = recolorize_seg(label_ref)
+        else:
+            recolorized_img = torch.Tensor(0)
+
         return {
-            "keypoints": keypoints,
+            "keypoints_list": keypoints_list,
             "keypoints_ref": keypoints_ref,
-            "centerpoints": centerpoints,
+            "centerpoints_list": centerpoints_list,
             "centerpoints_ref": centerpoints_ref,
             "line_list": line_list,
             "line_ref": line_ref,
-            "numpixels": numpixels,
             "numpixels_list": numpixels_list,
             "numpixels_ref": numpixels_ref,
             "segment_list": target_seg_list,
@@ -290,7 +282,7 @@ class PaintBucketLabelSegDataset(AnimeLabelSegDataset):
         assert self.color_redistribution_type in [None, "seg"]
         self.merge_label_prob = opt["merge_label_prob"] if "merge_label_prob" in opt else 0.0
         self.frame_distance_list = opt["frame_distance_list"] if "frame_distance_list" in opt else [1]
-        self.num_target_frames = opt.get("max_num_frames", 1)
+        self.num_target_frames = 12
 
         for character in os.listdir(self.root):
 

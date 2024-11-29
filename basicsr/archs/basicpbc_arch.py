@@ -43,6 +43,7 @@
 
 import argparse
 import math
+import numpy as np
 import open_clip
 import torch
 import torch.nn.functional as F
@@ -537,7 +538,7 @@ class BasicPBC(nn.Module):
         descriptor_dim=128,
         keypoint_encoder=[32, 64, 128],
         GNN_layer_num=9,
-        max_num_frames=10  # 최대 처리할 수 있는 프레임 수
+        num_target_frames=12
     ):
         super().__init__()
 
@@ -547,7 +548,7 @@ class BasicPBC(nn.Module):
         config.keypoint_encoder = keypoint_encoder
         config.GNN_layers_num = GNN_layer_num
         config.GNN_layers = ["self", "cross"] * GNN_layer_num
-        config.max_num_frames = max_num_frames
+        config.num_target_frames = num_target_frames
 
         self.config = config
 
@@ -557,7 +558,7 @@ class BasicPBC(nn.Module):
 
         # Add temporal encoding
         self.temporal_encoding = nn.Parameter(
-            torch.zeros(max_num_frames, self.config.descriptor_dim)
+            torch.zeros(self.config.num_target_frames, self.config.descriptor_dim)
         )
         self._init_temporal_encoding()
 
@@ -569,14 +570,14 @@ class BasicPBC(nn.Module):
         )
 
     def _init_temporal_encoding(self):
-        position = torch.arange(self.config.max_num_frames).unsqueeze(1)
+        position = torch.arange(self.config.num_target_frames).unsqueeze(1)
         div_term = torch.exp(
             torch.arange(0, self.config.descriptor_dim, 2) * 
             (-math.log(10000.0) / self.config.descriptor_dim)
         )
         
         # Create a new tensor for the temporal encoding
-        temporal_encoding = torch.zeros(self.config.max_num_frames, self.config.descriptor_dim)
+        temporal_encoding = torch.zeros(self.config.num_target_frames, self.config.descriptor_dim)
         temporal_encoding[:, 0::2] = torch.sin(position * div_term)
         temporal_encoding[:, 1::2] = torch.cos(position * div_term)
         
@@ -595,10 +596,9 @@ class BasicPBC(nn.Module):
 
         # Process all target frames together
         B = desc_ref.shape[0]
-        all_kpts = torch.stack([data["keypoints_list"][i].float() for i in range(self.config.num_target_frames)], dim=1)  # [B, T, N, 4]
         all_desc = []
         
-        for i in range(self.config.num_target_frames):
+        for i in range(len(data["line_list"])):
             desc_i = self.segment_desc(data["line_list"][i], data["segment_list"][i])
             desc_i = desc_i[..., 1:]  # [B, C, N_i]
             pos_i = self.kenc(normalize_keypoints(data["keypoints_list"][i], data["line_list"][i].shape))
@@ -656,15 +656,20 @@ class BasicPBC(nn.Module):
         valid1 = indices1 < scores.shape[1]
         indices0 = torch.where(valid0, indices0, indices0.new_tensor(-1))
         indices1 = torch.where(valid1, indices1, indices1.new_tensor(-1))
-
-        output = {
-            "match_scores": scores[:, :-1, :][0],
-            "matches0": indices0[0],
-            "matching_scores0": mscores0[0],
-            "skip_train": all_matches is None,
-        }
-
-        if all_matches is not None:
+        
+        if all_matches is None:
+            return {
+                "match_scores": scores[:, :-1, :][0],
+                "matches0": indices0[0],  # use -1 for invalid match
+                "matching_scores0": mscores0[0],
+                "loss": -1,
+                "skip_train": True,
+                "accuracy": -1,
+                "area_accuracy": -1,
+                "valid_accuracy": -1,
+                "invalid_accuracy": -1,
+            }
+        else:
             is_correct = all_matches_origin[0] == indices0[0]
             accuracy = (is_correct.sum() / len(all_matches_origin[0])).item()
             
@@ -673,11 +678,30 @@ class BasicPBC(nn.Module):
             # Calculate total area accuracy across all frames
             total_area_correct = 0
             total_pixels = 0
+            
+            # 각 프레임별 세그먼트 수 계산
+            segments_per_frame = [seg.max().item() for seg in data["segment_list"]]
+            cumsum_segments = [0] + list(np.cumsum(segments_per_frame))
+            
             for i, idx in enumerate(correct_indices):
-                frame_idx = idx // (len(all_matches_origin[0]) // self.config.num_target_frames)
-                segment_idx = idx % (len(all_matches_origin[0]) // self.config.num_target_frames)
-                total_area_correct += (data["segment_list"][frame_idx] == segment_idx + 1).sum()
-                total_pixels += data["numpixels_list"][frame_idx].sum()
+                # 프레임 인덱스 찾기
+                frame_idx = 0
+                for j in range(len(cumsum_segments)-1):
+                    if cumsum_segments[j] <= idx < cumsum_segments[j+1]:
+                        frame_idx = j
+                        break
+                
+                # 해당 프레임 내에서의 세그먼트 인덱스 계산
+                segment_idx = idx - cumsum_segments[frame_idx]
+                
+                # 현재 프레임의 세그먼트 맵
+                current_seg_map = data["segment_list"][frame_idx]
+                
+                # 해당 세그먼트의 픽셀 수 계산
+                # segment_idx는 0부터 시작하므로 +1
+                segment_mask = (current_seg_map == segment_idx + 1)
+                total_area_correct += segment_mask.sum()
+                total_pixels += current_seg_map.numel()  # 전체 픽셀 수
             
             area_accuracy = (total_area_correct / total_pixels).item()
             
@@ -685,12 +709,14 @@ class BasicPBC(nn.Module):
             valid_accuracy = ((is_correct & is_valid).sum() / is_valid.sum()).item()
             invalid_accuracy = ((is_correct & ~is_valid).sum() / (~is_valid).sum()).item() if (~is_valid).sum() > 0 else None
 
-            output.update({
+            return {
+                "match_scores": scores[:, :-1, :][0],
+                "matches0": indices0[0],  # use -1 for invalid match
+                "matching_scores0": mscores0[0],
                 "loss": loss,
+                "skip_train": False,
                 "accuracy": accuracy,
                 "area_accuracy": area_accuracy,
                 "valid_accuracy": valid_accuracy,
                 "invalid_accuracy": invalid_accuracy,
-            })
-
-        return output
+            }
