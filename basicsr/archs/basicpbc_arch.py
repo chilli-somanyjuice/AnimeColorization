@@ -253,13 +253,17 @@ class DeformableConv2d(nn.Module):
 
         self.padding = padding
         self.mask = mask
+        self.in_channels = in_channels
 
         self.channel_num = 3 * kernel_size * kernel_size if mask else 2 * kernel_size * kernel_size
         self.offset_unet = UNet_offset(in_channels, self.channel_num)
 
-        self.line_conv = nn.Conv2d(int(in_channels / 2), int(out_channels / 2), kernel_size, stride, padding=self.padding, bias=bias)
-
-        self.color_conv = nn.Conv2d(int(in_channels / 2), int(out_channels / 2), kernel_size, stride, padding=self.padding, bias=bias)
+        # 수정된 부분: 입력 채널에 따른 조건부 처리
+        if in_channels == 6:
+            self.line_conv = nn.Conv2d(int(in_channels/2), int(out_channels/2), kernel_size, stride, padding=self.padding, bias=bias)
+            self.color_conv = nn.Conv2d(int(in_channels/2), int(out_channels/2), kernel_size, stride, padding=self.padding, bias=bias)
+        else:  # in_channels == 3
+            self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=self.padding, bias=bias)
 
         self.out_conv = nn.Sequential(
             nn.InstanceNorm2d(out_channels),
@@ -270,35 +274,45 @@ class DeformableConv2d(nn.Module):
         )
 
     def forward(self, x, use_offset=False):
-        # While not using offset, it will be original conv. It is mainly for the ref.
-        # x should be in 6 channel
-        c, h, w = x.shape[1:]
-        if c != 6:
-            assert False, "input tensor should has 6 channels with 3 as line art and 3 as color."
-        max_offset = max(h, w) / 4.0
-        line_fea = x[:, 3:, :, :]
-        color_fea = x[:, :3, :, :]
+        if self.in_channels == 6:
+            # 6채널 입력 처리 (기존 로직)
+            c, h, w = x.shape[1:]
+            if c != 6:
+                assert False, "input tensor should has 6 channels with 3 as line art and 3 as color."
+            max_offset = max(h, w) / 4.0
+            line_fea = x[:, 3:, :, :]
+            color_fea = x[:, :3, :, :]
 
-        if use_offset:
-            out = self.offset_unet(x)
-            if self.mask:
-                o1, o2, mask = torch.chunk(out, 3, dim=1)
-                offset = torch.cat((o1, o2), dim=1)
-                mask = torch.sigmoid(mask)
-            else:
+            if use_offset:
+                out = self.offset_unet(x)
                 offset = out
                 mask = None
-            offset = offset.clamp(-max_offset, max_offset)
+                offset = offset.clamp(-max_offset, max_offset)
+                color_fea = torchvision.ops.deform_conv2d(
+                    input=color_fea, offset=offset, weight=self.color_conv.weight, 
+                    bias=self.color_conv.bias, padding=self.padding, mask=mask
+                )
+            else:
+                color_fea = self.color_conv(color_fea)
+            line_fea = self.line_conv(line_fea)
+            x_out = torch.cat((color_fea, line_fea), dim=1)
+            
+        else:  # 3채널 입력 처리
+            if use_offset:
+                out = self.offset_unet(x)
+                offset = out
+                mask = None
+                h, w = x.shape[2:]
+                max_offset = max(h, w) / 4.0
+                offset = offset.clamp(-max_offset, max_offset)
+                x_out = torchvision.ops.deform_conv2d(
+                    input=x, offset=offset, weight=self.conv.weight, 
+                    bias=self.conv.bias, padding=self.padding, mask=mask
+                )
+            else:
+                x_out = self.conv(x)
 
-            color_fea = torchvision.ops.deform_conv2d(
-                input=color_fea, offset=offset, weight=self.color_conv.weight, bias=self.color_conv.bias, padding=self.padding, mask=mask
-            )
-        else:
-            color_fea = self.color_conv(color_fea)
-        line_fea = self.line_conv(line_fea)
-        x_out = torch.cat((color_fea, line_fea), dim=1)
         x_out = self.out_conv(x_out)
-
         return x_out
 
 
@@ -311,7 +325,7 @@ class UNet(nn.Module):
 
         self.Maxpool = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        self.DCN1 = DeformableConv2d(in_channels=6, out_channels=64)
+        self.DCN1 = DeformableConv2d(in_channels=self.ch_in, out_channels=64)
         # conv_block(ch_in=self.ch_in,ch_out=64)
         self.Conv2 = conv_block(ch_in=64, ch_out=128)
         self.Conv3 = conv_block(ch_in=128, ch_out=256)
@@ -564,9 +578,14 @@ class BasicPBC(nn.Module):
 
         bin_score = torch.nn.Parameter(torch.tensor(1.0))
         self.register_parameter("bin_score", bin_score)
-        self.segment_desc = SegmentDescriptor(
+        
+        self.target_segment_desc = SegmentDescriptor(
             self.config.descriptor_dim, 
-            self.config.ch_in
+            3
+        )
+        self.ref_segment_desc = SegmentDescriptor(
+            self.config.descriptor_dim, 
+            6
         )
 
     def _init_temporal_encoding(self):
@@ -589,7 +608,8 @@ class BasicPBC(nn.Module):
         
         # Process reference frame
         kpts_ref = data["keypoints_ref"].float()
-        desc_ref = self.segment_desc(data["line_ref"], data["segment_ref"])
+        ref_img = torch.cat((data["recolorized_img"], data["line_ref"]), dim=1)
+        desc_ref = self.ref_segment_desc(ref_img, data["segment_ref"])
         desc_ref = desc_ref[..., 1:]  # [B, C, N_ref]
         pos_ref = self.kenc(normalize_keypoints(kpts_ref, data["line_ref"].shape))
         desc_ref = desc_ref + pos_ref
@@ -599,7 +619,7 @@ class BasicPBC(nn.Module):
         all_desc = []
         
         for i in range(len(data["line_list"])):
-            desc_i = self.segment_desc(data["line_list"][i], data["segment_list"][i])
+            desc_i = self.target_segment_desc(data["line_list"][i], data["segment_list"][i], use_offset=True)
             desc_i = desc_i[..., 1:]  # [B, C, N_i]
             pos_i = self.kenc(normalize_keypoints(data["keypoints_list"][i], data["line_list"][i].shape))
             desc_i = desc_i + pos_i
