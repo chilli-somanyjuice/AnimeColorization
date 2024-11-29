@@ -122,7 +122,8 @@ class AnimeLabelSegDataset(data.Dataset):
             np.random.shuffle(label_ref_list)
             # -1 means background in label, move it to top
             label_ref_list = np.concatenate(([-1], label_ref_list[label_ref_list != -1])) if -1 in label_ref_list else label_ref_list
-
+        
+        label_ref_list = list(label_ref_list)
         # Process reference frame keypoints
         h, w = label_ref.shape
         hh = np.arange(h)
