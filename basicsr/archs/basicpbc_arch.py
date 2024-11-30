@@ -662,37 +662,21 @@ class BasicPBC(nn.Module):
         all_matches = torch.cat([match for match in data["all_matches_list"]], dim=1) if "all_matches_list" in data else None
         all_matches_origin = all_matches.clone() if all_matches is not None else None
         
-        # Add debugging prints for tensor shapes
-        print(f"\nDebug tensor shapes:")
-        print(f"scores shape: {scores.shape}")  # Should be [B, T*N+1, N_ref+1]
-        print(f"scores: {scores}")
-
         if all_matches is not None:
-            print(f"all_matches shape: {all_matches.shape}")  # Should be [B, T*N]
-            print(f"all_matches values: {all_matches}")
-            print(f"all_matches unique values: {torch.unique(all_matches)}")
             n = scores.shape[2] - 1  # N_ref
             all_matches[all_matches == -1] = n
-            print(f"n_classes: {n+1}")
             
             reshaped_scores = scores[:, :-1, :].reshape(-1, n + 1)
             reshaped_matches = all_matches.long().reshape(-1)
-            print(f"reshaped_scores shape: {reshaped_scores.shape}")  # Should be [B*T*N, N_ref+1]
-            print(f"reshaped_matches shape: {reshaped_matches.shape}")  # Should be [B*T*N]
             
             loss = nn.functional.cross_entropy(
                 reshaped_scores,
                 reshaped_matches,
                 reduction="mean"
             )
-            print(f"loss: {loss}")
 
         scores = nn.functional.softmax(scores, dim=2)
-        print(f"scores after cross entropy and softmax shape: {scores.shape}")
-        print(f"scores after cross entropy and softmax: {scores}")
         max0, max1 = scores[:, :-1, :].max(2), scores[:, :, :-1].max(1)
-        print(f"max0: {max0}")
-        print(f"max1: {max1}")
         indices0, indices1 = max0.indices, max1.indices
         mscores0 = max0.values
 
@@ -700,10 +684,6 @@ class BasicPBC(nn.Module):
         valid1 = indices1 < scores.shape[1]
         indices0 = torch.where(valid0, indices0, indices0.new_tensor(-1))
         indices1 = torch.where(valid1, indices1, indices1.new_tensor(-1))
-        print(f"indices0 shape: {indices0.shape}")  # Should be [B, T*N]
-        print(f"indices1 shape: {indices1.shape}")  # Should be [B, N_ref]
-        print(f"max0 values shape: {max0.values.shape}")  # Should be [B, T*N]
-        print(f"max1 values shape: {max1.values.shape}")  # Should be [B, N_ref]
         
         if all_matches is None:
             return {
