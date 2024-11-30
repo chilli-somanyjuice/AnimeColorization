@@ -131,10 +131,11 @@ class AnimeLabelSegDataset(data.Dataset):
         xx, yy = np.meshgrid(ww, hh)
 
         label_ref_index = 1
+        label_ref_relabeled = np.zeros_like(label_ref)
+        label_mapping = {}  # 원래 라벨 -> 병합된 라벨 매핑
         keypoints_ref = []
         centerpoints_ref = []
         numpixels_ref = []
-        label_ref_relabeled = np.zeros_like(label_ref)
 
         for i, label_idx in enumerate(label_ref_list):
             mask = label_ref == label_idx
@@ -144,7 +145,9 @@ class AnimeLabelSegDataset(data.Dataset):
             else:
                 selected_label = label_ref_index
                 label_ref_index += 1
+            
             label_ref_relabeled[mask] = selected_label
+            label_mapping[label_idx] = selected_label  # 매핑 저장
             mask = label_ref_relabeled == selected_label
 
             xs = xx[mask]
@@ -188,9 +191,15 @@ class AnimeLabelSegDataset(data.Dataset):
             if self.shuffle_label:
                 np.random.shuffle(seg_list)
 
-            # match seg to label_ref
-            seg_list = list(seg_list)
-            mat_index = [(label_ref_list.index(seg_label_idx_map[x]) if seg_label_idx_map[x] in label_ref_list else -1) for x in seg_list]
+            # 병합된 라벨을 기준으로 mat_index 계산
+            mat_index = []
+            for seg_idx in seg_list:
+                original_label = seg_label_idx_map[seg_idx]
+                if original_label in label_mapping:
+                    mat_index.append(label_mapping[original_label] - 1)  # -1 because labels start from 1
+                else:
+                    mat_index.append(-1)  # no match found
+            
             mat_index = np.array(mat_index).astype(np.int64)
 
             keypoints = []
