@@ -619,7 +619,7 @@ class BasicPBC(nn.Module):
         all_desc = []
         
         for i in range(len(data["line_list"])):
-            desc_i = self.target_segment_desc(data["line_list"][i], data["segment_list"][i], use_offset=True)
+            desc_i = self.target_segment_desc(data["line_list"][i], data["segment_list"][i])
             desc_i = desc_i[..., 1:]  # [B, C, N_i]
             pos_i = self.kenc(normalize_keypoints(data["keypoints_list"][i], data["line_list"][i].shape))
             desc_i = desc_i + pos_i
