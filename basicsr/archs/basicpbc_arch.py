@@ -623,9 +623,13 @@ class BasicPBC(nn.Module):
             desc_i = desc_i[..., 1:]  # [B, C, N_i]
             pos_i = self.kenc(normalize_keypoints(data["keypoints_list"][i], data["line_list"][i].shape))
             desc_i = desc_i + pos_i
+            
             # Add temporal encoding
-            temporal_code = self.temporal_encoding[i:i+1].transpose(1, 2)
-            desc_i = desc_i + temporal_code
+            temporal_code = self.temporal_encoding[i:i+1]  # [1, D]
+            temporal_code = temporal_code.unsqueeze(0).expand(B, -1, -1)  # [B, 1, D]
+            temporal_code = temporal_code.transpose(1, 2)  # [B, D, 1]
+            desc_i = desc_i + temporal_code.expand(-1, -1, desc_i.size(2))  # [B, D, N]
+            
             all_desc.append(desc_i)
 
         # Concatenate all descriptors along the sequence dimension
