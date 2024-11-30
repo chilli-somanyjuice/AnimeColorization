@@ -62,34 +62,42 @@ class PBCModel(SRModel):
                     self.data[key] = data[key].to(self.device) if isinstance(data[key], torch.Tensor) else data[key]
 
     def optimize_parameters(self, current_iter):
-
-        self.optimizer_g.zero_grad()
+        # 그래디언트 누적 스텝 설정
+        accumulation_steps = self.opt.get('train', {}).get('accumulation_steps', 1)
+        
+        # 첫 번째 미니배치에서만 그래디언트 초기화
+        if current_iter % accumulation_steps == 0:
+            self.optimizer_g.zero_grad()
+        
         self.output = self.net_g(self.data)
-
+        
         for k, v in self.data.items():
             self.data[k] = v[0]
         pred = {**self.data, **self.output}
-
+        
         if pred["skip_train"]:
             return
-
+        
         l_total = 0
         loss_dict = OrderedDict()
-
-        loss = pred["loss"]  # / self.opt['datasets']['train']['batch_size_per_gpu']
+        
+        # loss를 accumulation_steps로 나누기
+        loss = pred["loss"] / accumulation_steps
         loss_dict["acc"] = torch.tensor(pred["accuracy"]).to(self.device)
         loss_dict["area_acc"] = torch.tensor(pred["area_accuracy"]).to(self.device)
         loss_dict["valid_acc"] = torch.tensor(pred["valid_accuracy"]).to(self.device)
         loss_dict["loss_total"] = self.l_ce(loss)
-
+        
         l_total += loss
         l_total.backward()
-        self.optimizer_g.step()
-
+        
+        # accumulation_steps만큼 모였을 때만 optimizer step 실행
+        if (current_iter + 1) % accumulation_steps == 0:
+            self.optimizer_g.step()
+            if self.ema_decay > 0:
+                self.model_ema(decay=self.ema_decay)
+        
         self.log_dict = self.reduce_loss_dict(loss_dict)
-
-        if self.ema_decay > 0:
-            self.model_ema(decay=self.ema_decay)
 
     def test(self):
         if hasattr(self, "net_g_ema"):
