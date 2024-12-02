@@ -293,6 +293,7 @@ class PaintBucketLabelSegDataset(AnimeLabelSegDataset):
         self.merge_label_prob = opt["merge_label_prob"] if "merge_label_prob" in opt else 0.0
         self.frame_distance_list = opt["frame_distance_list"] if "frame_distance_list" in opt else [1]
         self.num_target_frames = 12
+        self.sequence_stride = 6
 
         for character in os.listdir(self.root):
 
@@ -308,7 +309,7 @@ class PaintBucketLabelSegDataset(AnimeLabelSegDataset):
 
             L = len(line_list)
 
-            for i in range(L - self.num_target_frames):
+            for i in range(0, L - self.num_target_frames, self.sequence_stride):
                 target_indices = range(i + 1, i + 1 + self.num_target_frames)
                 
                 self.idx_list.append([idx_list[i]] + [idx_list[j] for j in target_indices])
